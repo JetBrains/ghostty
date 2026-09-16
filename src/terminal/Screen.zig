@@ -2014,6 +2014,9 @@ pub const Resize = struct {
     /// currently at a prompt. This detects OSC133 prompts lines and clears
     /// them. If set to `.last`, only the most recent prompt line is cleared.
     prompt_redraw: osc.semantic_prompt.Redraw = .false,
+
+    /// Whether this resize may pull rows back from scrollback.
+    scrollback_pull: PageList.ScrollbackPull = .default,
 };
 
 const resize_tw = tripwire.module(enum {
@@ -2110,6 +2113,7 @@ pub inline fn resize(
             .y = self.cursor.y,
             .pin = self.cursor.page_pin,
         },
+        .scrollback_pull = opts.scrollback_pull,
     });
 
     // No more failures are possible after this. Enforced by compiler
@@ -7167,6 +7171,548 @@ test "Screen: resize (no reflow) more rows with scrollback cursor end" {
         defer alloc.free(contents);
         try testing.expectEqualStrings(str, contents);
     }
+}
+
+test "Screen: resize (no reflow) more rows scrollback pull never" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    // Same shape as the test above, where `.cursor_at_bottom` pulls
+    var s = try init(io, alloc, .{ .cols = 7, .rows = 3, .max_scrollback_bytes = 2 });
+    defer s.deinit();
+    const str = "1ABCD\n2EFGH\n3IJKL\n4ABCD\n5EFGH";
+    try s.testWriteString(str);
+    try s.resize(.{ .cols = 7, .rows = 10, .reflow = false, .scrollback_pull = .never });
+
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("3IJKL\n4ABCD\n5EFGH", contents);
+    }
+
+    // History is untouched
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .screen = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings(str, contents);
+    }
+}
+
+test "Screen: resize (no reflow) more rows scrollback pull always" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try init(io, alloc, .{ .cols = 7, .rows = 3, .max_scrollback_bytes = 2 });
+    defer s.deinit();
+    const str = "1ABCD\n2EFGH\n3IJKL\n4ABCD\n5EFGH";
+    try s.testWriteString(str);
+
+    // Move the cursor off the bottom row, where `.cursor_at_bottom` won't pull
+    s.cursorAbsolute(0, 0);
+    try s.resize(.{ .cols = 7, .rows = 10, .reflow = false, .scrollback_pull = .always });
+
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings(str, contents);
+    }
+}
+
+test "Screen: resize more rows and more cols scrollback pull cursor_at_bottom" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    // Content is narrower than both widths, so nothing wraps
+    var s = try init(io, alloc, .{ .cols = 10, .rows = 3, .max_scrollback_bytes = 1000 });
+    defer s.deinit();
+    try s.testWriteString("1ABCD\n2EFGH\n3IJKL\n4ABCD\n5EFGH");
+    try s.resize(.{
+        .cols = 12,
+        .rows = 6,
+        .reflow = true,
+        .scrollback_pull = .cursor_at_bottom,
+    });
+
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("1ABCD\n2EFGH\n3IJKL\n4ABCD\n5EFGH", contents);
+    }
+    try testing.expectEqual(4, s.cursor.y);
+}
+
+test "Screen: resize more rows and more cols scrollback pull never" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try init(io, alloc, .{ .cols = 10, .rows = 3, .max_scrollback_bytes = 1000 });
+    defer s.deinit();
+    try s.testWriteString("1ABCD\n2EFGH\n3IJKL\n4ABCD\n5EFGH");
+    try s.resize(.{ .cols = 12, .rows = 6, .reflow = true, .scrollback_pull = .never });
+
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("3IJKL\n4ABCD\n5EFGH", contents);
+    }
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .screen = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("1ABCD\n2EFGH\n3IJKL\n4ABCD\n5EFGH", contents);
+    }
+    try testing.expectEqual(2, s.cursor.y);
+}
+
+test "Screen: resize more rows and less cols scrollback pull never" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    // Narrowing reflows after the rows grow
+    var s = try init(io, alloc, .{ .cols = 10, .rows = 3, .max_scrollback_bytes = 1000 });
+    defer s.deinit();
+    try s.testWriteString("1ABCD\n2EFGH\n3IJKL\n4ABCD\n5EFGH");
+    try s.resize(.{ .cols = 6, .rows = 6, .reflow = true, .scrollback_pull = .never });
+
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("3IJKL\n4ABCD\n5EFGH", contents);
+    }
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .screen = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("1ABCD\n2EFGH\n3IJKL\n4ABCD\n5EFGH", contents);
+    }
+    try testing.expectEqual(2, s.cursor.y);
+}
+
+test "Screen: resize more cols scrollback pull cursor_at_bottom" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    // "CCCCCCCCC" is soft-wrapped at 5 cols, so "AAA" is in scrollback.
+    var s = try init(io, alloc, .{ .cols = 5, .rows = 3, .max_scrollback_bytes = 1000 });
+    defer s.deinit();
+    try s.testWriteString("AAA\nBBB\nCCCCCCCCC");
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("BBB\nCCCCC\nCCCC", contents);
+    }
+
+    // Unwrapping frees a row, which this policy fills from scrollback.
+    try s.resize(.{
+        .cols = 10,
+        .rows = 3,
+        .reflow = true,
+        .scrollback_pull = .cursor_at_bottom,
+    });
+
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("AAA\nBBB\nCCCCCCCCC", contents);
+    }
+    try testing.expectEqual(2, s.cursor.y);
+}
+
+test "Screen: resize more cols scrollback pull always" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    // Only `.never` changes col behavior, so this matches `.cursor_at_bottom`.
+    var s = try init(io, alloc, .{ .cols = 5, .rows = 3, .max_scrollback_bytes = 1000 });
+    defer s.deinit();
+    try s.testWriteString("AAA\nBBB\nCCCCCCCCC");
+    try s.resize(.{ .cols = 10, .rows = 3, .reflow = true, .scrollback_pull = .always });
+
+    const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
+    defer alloc.free(contents);
+    try testing.expectEqualStrings("AAA\nBBB\nCCCCCCCCC", contents);
+}
+
+test "Screen: resize more cols scrollback pull never" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    // Same shape as the `.cursor_at_bottom` test above, which pulls "AAA"
+    // back. "AAA" is a whole line in scrollback, so it has to stay there
+    // and the freed row becomes blank at the bottom.
+    var s = try init(io, alloc, .{ .cols = 5, .rows = 3, .max_scrollback_bytes = 1000 });
+    defer s.deinit();
+    try s.testWriteString("AAA\nBBB\nCCCCCCCCC");
+    try s.resize(.{ .cols = 10, .rows = 3, .reflow = true, .scrollback_pull = .never });
+
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("BBB\nCCCCCCCCC", contents);
+    }
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .history = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("AAA", contents);
+    }
+    try testing.expectEqual(1, s.cursor.y);
+}
+
+test "Screen: resize more cols scrollback pull never cursor above bottom" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try init(io, alloc, .{ .cols = 5, .rows = 4, .max_scrollback_bytes = 1000 });
+    defer s.deinit();
+    try s.testWriteString("AAA\nBBB\nCCCCCCCCC\nDDD");
+
+    // Park the cursor on the wrap continuation of "CCCCCCCCC"
+    s.cursorAbsolute(0, 2);
+    try s.resize(.{ .cols = 10, .rows = 4, .reflow = true, .scrollback_pull = .never });
+
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("BBB\nCCCCCCCCC\nDDD", contents);
+    }
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .history = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("AAA", contents);
+    }
+
+    // The cursor follows its own cell into the unwrapped row, and padding
+    // the bottom must not push it out of the active area.
+    try testing.expectEqual(5, s.cursor.x);
+    try testing.expectEqual(1, s.cursor.y);
+    try testing.expect(s.cursor.y < s.pages.rows);
+}
+
+test "Screen: resize more cols scrollback pull never wrap straddles boundary" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    // "EEEEEEEEEEEE" needs 4 rows at 3 cols: one in scrollback and three
+    // active. It isn't fully in scrollback, so unwrapping it back into view
+    // is correct. Only "AAA" has to stay put.
+    var s = try init(io, alloc, .{ .cols = 3, .rows = 3, .max_scrollback_bytes = 1000 });
+    defer s.deinit();
+    try s.testWriteString("AAA\nEEEEEEEEEEEE");
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("EEE\nEEE\nEEE", contents);
+    }
+
+    try s.resize(.{ .cols = 4, .rows = 3, .reflow = true, .scrollback_pull = .never });
+
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("EEEE\nEEEE\nEEEE", contents);
+    }
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .history = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("AAA", contents);
+    }
+}
+
+test "Screen: resize more cols scrollback pull never history only wrap" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    // Only scrollback unwraps, so the active area doesn't change. Rewrapping
+    // history in place is fine as long as it doesn't come back.
+    var s = try init(io, alloc, .{ .cols = 5, .rows = 3, .max_scrollback_bytes = 1000 });
+    defer s.deinit();
+    try s.testWriteString("AAAAAAAAA\nBBB\nCCC\nDDD");
+    try s.resize(.{ .cols = 10, .rows = 3, .reflow = true, .scrollback_pull = .never });
+
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("BBB\nCCC\nDDD", contents);
+    }
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .history = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("AAAAAAAAA", contents);
+    }
+    try testing.expectEqual(2, s.cursor.y);
+}
+
+test "Screen: resize more cols scrollback pull never empty active" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    // The shape just after a clear: a blank active area with the cursor at
+    // the top. Reflow drops blank rows at the end of the list, so the
+    // anchored row is itself a blank row that has to survive.
+    var s = try init(io, alloc, .{ .cols = 5, .rows = 3, .max_scrollback_bytes = 1000 });
+    defer s.deinit();
+    try s.testWriteString("AAA\nBBB\nCCC\nDDD\nEEE\n\n\n");
+    s.cursorAbsolute(0, 0);
+
+    try s.resize(.{ .cols = 10, .rows = 3, .reflow = true, .scrollback_pull = .never });
+
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("", contents);
+    }
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .history = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("AAA\nBBB\nCCC\nDDD\nEEE", contents);
+    }
+    try testing.expectEqual(0, s.cursor.y);
+}
+
+test "Screen: resize more cols scrollback pull never scrolled up" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    // Scrolled back into history, the visible rows stay visible. The
+    // viewport text reads the same either way, so check the row count:
+    // 3 content rows plus the blank row the unwrap freed.
+    var s = try init(io, alloc, .{ .cols = 5, .rows = 3, .max_scrollback_bytes = 1000 });
+    defer s.deinit();
+    try s.testWriteString("AAA\nBBB\nCCCCCCCCC");
+    s.scroll(.{ .delta_row = -1 });
+
+    try s.resize(.{ .cols = 10, .rows = 3, .reflow = true, .scrollback_pull = .never });
+
+    const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
+    defer alloc.free(contents);
+    try testing.expectEqualStrings("AAA\nBBB\nCCCCCCCCC", contents);
+    try testing.expectEqual(4, s.pages.total_rows);
+}
+
+test "Screen: resize more cols scrollback pull never wide chars" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    // Four wide glyphs are 8 cells, so they need two rows at 6 cols and one
+    // at 8. Reflow has its own spacer handling and the anchor is a pin into
+    // that, so cover it.
+    var s = try init(io, alloc, .{ .cols = 6, .rows = 2, .max_scrollback_bytes = 1000 });
+    defer s.deinit();
+    try s.testWriteString("ABC\n世界世界");
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("世界世\n界", contents);
+    }
+
+    try s.resize(.{ .cols = 8, .rows = 2, .reflow = true, .scrollback_pull = .never });
+
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("世界世界", contents);
+    }
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .history = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("ABC", contents);
+    }
+}
+
+test "Screen: resize more cols then back scrollback pull never" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    // Narrowing back happens to undo a pull, so assert the intermediate
+    // state too or this passes with the policy ignored.
+    var s = try init(io, alloc, .{ .cols = 5, .rows = 3, .max_scrollback_bytes = 1000 });
+    defer s.deinit();
+    try s.testWriteString("AAA\nBBB\nCCCCCCCCC");
+
+    try s.resize(.{ .cols = 10, .rows = 3, .reflow = true, .scrollback_pull = .never });
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("BBB\nCCCCCCCCC", contents);
+    }
+
+    try s.resize(.{ .cols = 5, .rows = 3, .reflow = true, .scrollback_pull = .never });
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("BBB\nCCCCC\nCCCC", contents);
+    }
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .history = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("AAA", contents);
+    }
+}
+
+test "Screen: resize less cols scrollback pull never" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    // Narrowing needs more rows for the same text, so the top of the active
+    // area leaves for history. That direction is allowed: a screen-only pty
+    // buffer loses those rows off the top too.
+    var s = try init(io, alloc, .{ .cols = 10, .rows = 3, .max_scrollback_bytes = 1000 });
+    defer s.deinit();
+    try s.testWriteString("AAA\nBBB\nCCC\nDDD\nEEEEEEEEE");
+    try s.resize(.{ .cols = 5, .rows = 3, .reflow = true, .scrollback_pull = .never });
+
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("DDD\nEEEEE\nEEEE", contents);
+    }
+    {
+        const contents = try s.dumpStringAllocUnwrapped(alloc, .{ .history = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("AAA\nBBB\nCCC", contents);
+    }
+    try testing.expectEqual(2, s.cursor.y);
+}
+
+test "Screen: resize more rows and more cols scrollback pull never with wrapping" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    // Cols are reflowed before the rows grow, so the policy has to hold in
+    // both steps.
+    var s = try init(io, alloc, .{ .cols = 5, .rows = 3, .max_scrollback_bytes = 1000 });
+    defer s.deinit();
+    try s.testWriteString("AAA\nBBB\nCCCCCCCCC");
+    try s.resize(.{ .cols = 10, .rows = 5, .reflow = true, .scrollback_pull = .never });
+
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("BBB\nCCCCCCCCC", contents);
+    }
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .history = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("AAA", contents);
+    }
+    try testing.expectEqual(1, s.cursor.y);
+}
+
+test "Screen: resize more rows and less cols scrollback pull never with wrapping" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    // Growing the rows appends blank rows, then narrowing reflows and drops
+    // them again. The rows freed that way must not come from history:
+    // "BBB" is a whole line in history.
+    var s = try init(io, alloc, .{ .cols = 6, .rows = 2, .max_scrollback_bytes = 1000 });
+    defer s.deinit();
+    try s.testWriteString("AAAAAAAAA\nBBB\nCCC\nDDD");
+    try s.resize(.{ .cols = 4, .rows = 4, .reflow = true, .scrollback_pull = .never });
+
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("CCC\nDDD", contents);
+    }
+    {
+        const contents = try s.dumpStringAllocUnwrapped(alloc, .{ .history = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("AAAAAAAAA\nBBB", contents);
+    }
+    try testing.expectEqual(1, s.cursor.y);
+}
+
+test "Screen: resize more rows and less cols scrollback pull never wide chars" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    // Same shape as the test above, but the history line is wide glyphs so
+    // it rewraps to a different row count.
+    var s = try init(io, alloc, .{ .cols = 6, .rows = 2, .max_scrollback_bytes = 1000 });
+    defer s.deinit();
+    try s.testWriteString("世界世界\nBBB\nCCC\nDDD");
+    try s.resize(.{ .cols = 4, .rows = 4, .reflow = true, .scrollback_pull = .never });
+
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("CCC\nDDD", contents);
+    }
+    {
+        const contents = try s.dumpStringAllocUnwrapped(alloc, .{ .history = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("世界世界\nBBB", contents);
+    }
+    try testing.expectEqual(1, s.cursor.y);
+}
+
+test "Screen: resize less rows and more cols scrollback pull never" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    // Widening reflows before the rows shrink. Shrinking pushes content into
+    // history on its own, so the anchor never binds.
+    var s = try init(io, alloc, .{ .cols = 5, .rows = 4, .max_scrollback_bytes = 1000 });
+    defer s.deinit();
+    try s.testWriteString("AAA\nBBB\nCCCCCCCCC\nDDD");
+    try s.resize(.{ .cols = 10, .rows = 2, .reflow = true, .scrollback_pull = .never });
+
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("CCCCCCCCC\nDDD", contents);
+    }
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .history = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("AAA\nBBB", contents);
+    }
+    try testing.expectEqual(1, s.cursor.y);
+}
+
+test "Screen: resize less rows and less cols scrollback pull never" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    // Rows shrink before the narrowing reflow here, where the test above
+    // reflows first. Both push content into history, so the anchor must not
+    // undo either of them, in either order.
+    var s = try init(io, alloc, .{ .cols = 10, .rows = 5, .max_scrollback_bytes = 1000 });
+    defer s.deinit();
+    try s.testWriteString("AAA\nBBB\nCCC\nDDD\nEEEEEEEEE");
+    try s.resize(.{ .cols = 5, .rows = 3, .reflow = true, .scrollback_pull = .never });
+
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("DDD\nEEEEE\nEEEE", contents);
+    }
+    {
+        const contents = try s.dumpStringAllocUnwrapped(alloc, .{ .history = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("AAA\nBBB\nCCC", contents);
+    }
+    try testing.expectEqual(2, s.cursor.y);
 }
 
 test "Screen: resize (no reflow) less rows with scrollback" {

@@ -1220,6 +1220,31 @@ pub fn clone(
     return result;
 }
 
+/// Whether a resize may pull rows back from scrollback into the active area.
+pub const ScrollbackPull = enum {
+    /// Always pull on row growth, regardless of the cursor position.
+    always,
+
+    /// Pull on row growth only if the cursor is on the bottom row.
+    /// This is the default.
+    cursor_at_bottom,
+
+    /// Never pull. Row growth appends blank rows at the bottom instead,
+    /// and a col change keeps the top of the active area on the content it was on
+    /// before the resize, so that reflow can't slide it back over history either.
+    ///
+    /// A logical line is only fully in history once all of its rows have left the
+    /// active area. A soft-wrapped logical line with any row still in the active area
+    /// can still unwrap back into view, since it isn't fully in history yet.
+    ///
+    /// This is for embedders whose pty keeps a screen buffer of its own
+    /// (e.g. Windows ConPTY). That buffer has no scrollback to pull from,
+    /// so pulling desynchronizes the terminal and pty buffers.
+    never,
+
+    pub const default: ScrollbackPull = .cursor_at_bottom;
+};
+
 /// Resize options
 pub const Resize = struct {
     /// The new cols/cells of the screen.
@@ -1233,6 +1258,9 @@ pub const Resize = struct {
     /// Set this to the current cursor position in the active area. Some
     /// resize/reflow behavior depends on the cursor position.
     cursor: ?Cursor = null,
+
+    /// Whether this resize may pull rows back from scrollback.
+    scrollback_pull: ScrollbackPull = .default,
 
     pub const Cursor = struct {
         x: size.CellCountInt,
@@ -1295,7 +1323,7 @@ pub fn resize(self: *PageList, opts: Resize) Allocator.Error!void {
         .gt => {
             // We grow rows after cols so that we can do our unwrapping/reflow
             // before we do a no-reflow grow.
-            try self.resizeCols(cols, opts.cursor);
+            try self.resizeCols(cols, opts.cursor, opts.scrollback_pull);
             try self.resizeWithoutReflow(opts);
         },
 
@@ -1307,7 +1335,7 @@ pub fn resize(self: *PageList, opts: Resize) Allocator.Error!void {
                 copy.cols = self.cols;
                 break :opts copy;
             });
-            try self.resizeCols(cols, opts.cursor);
+            try self.resizeCols(cols, opts.cursor, opts.scrollback_pull);
         },
     }
 
@@ -1332,8 +1360,19 @@ fn resizeCols(
     self: *PageList,
     cols: size.CellCountInt,
     cursor: ?Resize.Cursor,
+    scrollback_pull: ScrollbackPull,
 ) Allocator.Error!void {
     assert(cols != self.cols);
+
+    // The active area is the last `rows` rows of the list, so a reflow that
+    // changes how many rows the same text needs moves that boundary over the
+    // content. Under `.never` we pin the first active row so that we can put
+    // the boundary back on it at the end.
+    const active_anchor: ?*Pin = if (scrollback_pull == .never) anchor: {
+        const p = self.pin(.{ .active = .{} }) orelse break :anchor null;
+        break :anchor try self.trackPin(p);
+    } else null;
+    defer if (active_anchor) |p| self.untrackPin(p);
 
     // If we have a cursor position (x,y), then we try under any col resizing
     // to keep the same number remaining active rows beneath it. This is a
@@ -1506,6 +1545,19 @@ fn resizeCols(
         .pin => if (self.pinIsActive(self.viewport_pin.*)) {
             self.viewport = .active;
         },
+    }
+
+    // Put the boundary back on the anchor by padding the bottom with blank rows.
+    // If reflow pushed the anchor into history instead, because
+    // narrowing needs more rows for the same text, leave it there.
+    //
+    // The anchor is a cell, not a row, so a line whose head is in history
+    // and whose tail is still active unwraps back into view.
+    if (active_anchor) |p| {
+        if (self.pointFromPin(.active, p.*)) |pt| {
+            for (0..pt.active.y) |_| _ = try self.grow();
+        }
+        return;
     }
 
     // See preserved_cursor setup for why.
@@ -2851,16 +2903,21 @@ fn resizeWithoutReflow(self: *PageList, opts: Resize) Allocator.Error!void {
             // Making rows larger we adjust our row count, and then grow
             // to the row count.
             .gt => gt: {
-                // If our rows increased and our cursor is NOT at the bottom,
-                // we want to try to preserve the y value of the old cursor.
-                // In other words, we don't want to "pull down" scrollback.
-                // This is purely a UX feature.
-                if (opts.cursor) |cursor| cursor: {
-                    if (cursor.y >= self.rows - 1) break :cursor;
+                // Whether we pull scrollback down or append blank rows at the bottom.
+                // Pulling down is purely a UX feature, so it's configurable.
+                const pull = switch (opts.scrollback_pull) {
+                    .always => true,
+                    .never => false,
+                    .cursor_at_bottom => if (opts.cursor) |cursor|
+                        cursor.y >= self.rows - 1
+                    else
+                        true,
+                };
 
-                    // Cursor is not at the bottom, so we just grow our
-                    // rows and we're done. Cursor does NOT change for this
-                    // since we're not pulling down scrollback.
+                if (!pull) {
+                    // We want to preserve the y value of the old cursor, so
+                    // we just grow our rows and we're done. Cursor does NOT
+                    // change for this since we're not pulling down scrollback.
                     const delta = rows - self.rows;
                     self.rows = rows;
                     for (0..delta) |_| _ = try self.grow();
@@ -2872,10 +2929,8 @@ fn resizeWithoutReflow(self: *PageList, opts: Resize) Allocator.Error!void {
                 // area.
                 self.rows = rows;
 
-                // Cursor is at the bottom or we don't care about cursors.
-                // In this case, if we have enough rows in our pages, we
-                // just update our rows and we're done. This effectively
-                // "pulls down" scrollback.
+                // We're pulling scrollback down. If we have enough rows
+                // in our pages we just update our rows and we're done.
                 //
                 // This traversal intentionally reads only node metadata. A
                 // compressed history page pulled into the active area remains
@@ -14834,7 +14889,7 @@ test "PageList resize (no reflow) more rows" {
     }
 }
 
-test "PageList resize (no reflow) more rows with history" {
+test "PageList resize (no reflow) more rows scrollback pull cursor_at_bottom without cursor" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
@@ -14854,7 +14909,11 @@ test "PageList resize (no reflow) more rows with history" {
     defer s.untrackPin(p);
 
     // Resize
-    try s.resize(.{ .rows = 5, .reflow = false });
+    try s.resize(.{
+        .rows = 5,
+        .reflow = false,
+        .scrollback_pull = .cursor_at_bottom,
+    });
     try testing.expectEqual(@as(usize, 5), s.rows);
     try testing.expectEqual(@as(usize, 53), s.totalRows());
 
@@ -15802,7 +15861,7 @@ test "PageList resize (no reflow) more cols forces smaller cap" {
     }
 }
 
-test "PageList resize (no reflow) more rows adds blank rows if cursor at bottom" {
+test "PageList resize (no reflow) more rows scrollback pull cursor_at_bottom cursor above bottom" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
@@ -15847,6 +15906,7 @@ test "PageList resize (no reflow) more rows adds blank rows if cursor at bottom"
         .rows = 10,
         .reflow = false,
         .cursor = .{ .x = 0, .y = s.rows - 2 },
+        .scrollback_pull = .cursor_at_bottom,
     });
     try testing.expectEqual(@as(usize, 5), s.cols);
     try testing.expectEqual(@as(usize, 10), s.rows);
@@ -15873,6 +15933,484 @@ test "PageList resize (no reflow) more rows adds blank rows if cursor at bottom"
         const expected: u21 = @intCast(y + 2);
         try testing.expectEqual(expected, get.cell.content.codepoint.data);
     }
+}
+
+test "PageList resize (no reflow) more rows scrollback pull cursor_at_bottom cursor at bottom" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 5, .rows = 3 });
+    defer s.deinit();
+
+    // Grow to 5 total rows, simulating 3 active + 2 scrollback
+    try s.growRows(2);
+    try testing.expect(s.pages.first == s.pages.last);
+    const page = s.pages.first.?.page();
+    for (0..s.totalRows()) |y| {
+        const rac = page.getRowAndCell(0, y);
+        rac.cell.* = .{
+            .content_tag = .codepoint,
+            .content = .{ .codepoint = .{ .data = @intCast(y) } },
+        };
+    }
+
+    // Put a tracked pin at the cursor
+    const p = try s.trackPin(s.pin(.{ .active = .{ .x = 0, .y = s.rows - 1 } }).?);
+    defer s.untrackPin(p);
+
+    // Resize. Cursor is at the bottom, so we pull down scrollback.
+    try s.resizeWithoutReflow(.{
+        .rows = 10,
+        .reflow = false,
+        .cursor = .{ .x = 0, .y = s.rows - 1 },
+        .scrollback_pull = .cursor_at_bottom,
+    });
+    try testing.expectEqual(@as(usize, 10), s.rows);
+
+    // 10 because both scrollback rows were pulled into the active
+    try testing.expectEqual(@as(usize, 10), s.totalRows());
+
+    // Our cursor should move since the active grew upwards
+    try testing.expectEqual(point.Point{ .active = .{
+        .x = 0,
+        .y = 4,
+    } }, s.pointFromPin(.active, p.*).?);
+
+    // Active should be at the top of the screen
+    {
+        const pt = s.getCell(.{ .active = .{} }).?.screenPoint();
+        try testing.expectEqual(point.Point{ .screen = .{
+            .x = 0,
+            .y = 0,
+        } }, pt);
+    }
+
+    // Go through our active, we should get 0,1,2,3,4
+    for (0..5) |y| {
+        const get = s.getCell(.{ .active = .{ .y = @intCast(y) } }).?;
+        try testing.expectEqual(@as(u21, @intCast(y)), get.cell.content.codepoint.data);
+    }
+}
+
+test "PageList resize (no reflow) more rows scrollback pull always cursor above bottom" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 5, .rows = 3 });
+    defer s.deinit();
+
+    // Grow to 5 total rows, simulating 3 active + 2 scrollback
+    try s.growRows(2);
+    try testing.expect(s.pages.first == s.pages.last);
+    const page = s.pages.first.?.page();
+    for (0..s.totalRows()) |y| {
+        const rac = page.getRowAndCell(0, y);
+        rac.cell.* = .{
+            .content_tag = .codepoint,
+            .content = .{ .codepoint = .{ .data = @intCast(y) } },
+        };
+    }
+
+    const p = try s.trackPin(s.pin(.{ .active = .{ .x = 0, .y = s.rows - 2 } }).?);
+    defer s.untrackPin(p);
+
+    // Cursor is not at the bottom, but `.always` pulls anyway.
+    try s.resizeWithoutReflow(.{
+        .rows = 10,
+        .reflow = false,
+        .cursor = .{ .x = 0, .y = s.rows - 2 },
+        .scrollback_pull = .always,
+    });
+    try testing.expectEqual(@as(usize, 10), s.rows);
+    try testing.expectEqual(@as(usize, 10), s.totalRows());
+
+    try testing.expectEqual(point.Point{ .active = .{
+        .x = 0,
+        .y = 3,
+    } }, s.pointFromPin(.active, p.*).?);
+
+    {
+        const pt = s.getCell(.{ .active = .{} }).?.screenPoint();
+        try testing.expectEqual(point.Point{ .screen = .{
+            .x = 0,
+            .y = 0,
+        } }, pt);
+    }
+}
+
+test "PageList resize (no reflow) more rows scrollback pull never without cursor" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 10, .rows = 3 });
+    defer s.deinit();
+    try s.growRows(50);
+    {
+        const pt = s.getCell(.{ .active = .{} }).?.screenPoint();
+        try testing.expectEqual(point.Point{ .screen = .{
+            .x = 0,
+            .y = 50,
+        } }, pt);
+    }
+
+    // Put a tracked pin in the active area
+    const p = try s.trackPin(s.pin(.{ .active = .{ .x = 0, .y = 2 } }).?);
+    defer s.untrackPin(p);
+
+    // Without a cursor, `.cursor_at_bottom` would pull scrollback down.
+    try s.resize(.{ .rows = 5, .reflow = false, .scrollback_pull = .never });
+    try testing.expectEqual(@as(usize, 5), s.rows);
+    try testing.expectEqual(@as(usize, 55), s.totalRows());
+
+    // Our cursor should not move, since we grew downwards.
+    try testing.expectEqual(point.Point{ .active = .{
+        .x = 0,
+        .y = 2,
+    } }, s.pointFromPin(.active, p.*).?);
+
+    // Active should be where it was
+    {
+        const pt = s.getCell(.{ .active = .{} }).?.screenPoint();
+        try testing.expectEqual(point.Point{ .screen = .{
+            .x = 0,
+            .y = 50,
+        } }, pt);
+    }
+}
+
+test "PageList resize (no reflow) more rows scrollback pull never cursor at bottom" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 5, .rows = 3 });
+    defer s.deinit();
+
+    // Grow to 5 total rows, simulating 3 active + 2 scrollback
+    try s.growRows(2);
+    try testing.expect(s.pages.first == s.pages.last);
+    const page = s.pages.first.?.page();
+    for (0..s.totalRows()) |y| {
+        const rac = page.getRowAndCell(0, y);
+        rac.cell.* = .{
+            .content_tag = .codepoint,
+            .content = .{ .codepoint = .{ .data = @intCast(y) } },
+        };
+    }
+
+    // Put a tracked pin at the cursor
+    const p = try s.trackPin(s.pin(.{ .active = .{ .x = 0, .y = s.rows - 1 } }).?);
+    defer s.untrackPin(p);
+    const original_cursor = s.pointFromPin(.active, p.*).?.active;
+
+    // The cursor is at the bottom, which is when `.cursor_at_bottom` pulls.
+    try s.resizeWithoutReflow(.{
+        .rows = 10,
+        .reflow = false,
+        .cursor = .{ .x = 0, .y = s.rows - 1 },
+        .scrollback_pull = .never,
+    });
+    try testing.expectEqual(@as(usize, 5), s.cols);
+    try testing.expectEqual(@as(usize, 10), s.rows);
+
+    // Our cursor should not change.
+    try testing.expectEqual(original_cursor, s.pointFromPin(.active, p.*).?.active);
+
+    // 12 because we have our 10 rows in the active + 2 in the scrollback
+    try testing.expectEqual(@as(usize, 12), s.totalRows());
+
+    // Active should be at the same place it was
+    {
+        const pt = s.getCell(.{ .active = .{} }).?.screenPoint();
+        try testing.expectEqual(point.Point{ .screen = .{
+            .x = 0,
+            .y = 2,
+        } }, pt);
+    }
+
+    // Go through our active, we should get only 2,3,4
+    for (0..3) |y| {
+        const get = s.getCell(.{ .active = .{ .y = @intCast(y) } }).?;
+        const expected: u21 = @intCast(y + 2);
+        try testing.expectEqual(expected, get.cell.content.codepoint.data);
+    }
+}
+
+test "PageList resize (no reflow) more rows scrollback pull never no history" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // With no scrollback to pull, `.never` matches the other policies
+    var s = try init(alloc, .{ .cols = 5, .rows = 3 });
+    defer s.deinit();
+    try testing.expectEqual(@as(usize, 3), s.totalRows());
+
+    try s.resizeWithoutReflow(.{
+        .rows = 10,
+        .reflow = false,
+        .cursor = .{ .x = 0, .y = s.rows - 1 },
+        .scrollback_pull = .never,
+    });
+    try testing.expectEqual(@as(usize, 10), s.rows);
+    try testing.expectEqual(@as(usize, 10), s.totalRows());
+}
+
+test "PageList resize (no reflow) more rows scrollback pull never contains viewport" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // The blank-row path skips the viewport fixup the pull path runs
+    var s = try init(alloc, .{ .cols = 5, .rows = 5, .max_size = 1 });
+    defer s.deinit();
+    try testing.expect(s.pages.first == s.pages.last);
+
+    // Make it so we have scrollback
+    _ = try s.grow();
+
+    try testing.expectEqual(@as(usize, 5), s.rows);
+    try testing.expectEqual(@as(usize, 6), s.totalRows());
+
+    // Set viewport above active by scrolling up one.
+    s.scroll(.{ .delta_row = -1 });
+    try testing.expectEqual(Viewport.top, s.viewport);
+
+    try s.resize(.{ .rows = 7, .reflow = false, .scrollback_pull = .never });
+    try testing.expectEqual(@as(usize, 7), s.rows);
+    try testing.expectEqual(@as(usize, 8), s.totalRows());
+    try testing.expectEqual(Viewport.top, s.viewport);
+}
+
+test "PageList resize reflow more cols more rows scrollback pull cursor_at_bottom" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 10, .rows = 3 });
+    defer s.deinit();
+    try s.growRows(5);
+    const page = s.pages.first.?.page();
+    for (0..s.totalRows()) |y| {
+        const rac = page.getRowAndCell(0, y);
+        rac.cell.* = .{
+            .content_tag = .codepoint,
+            .content = .{ .codepoint = .{ .data = @intCast(y + 'A') } },
+        };
+    }
+
+    // Resize. No cursor, so the cursor-gated policy pulls scrollback down.
+    try s.resize(.{
+        .cols = 20,
+        .rows = 6,
+        .reflow = true,
+        .scrollback_pull = .cursor_at_bottom,
+    });
+    try testing.expectEqual(@as(usize, 20), s.cols);
+    try testing.expectEqual(@as(usize, 6), s.rows);
+    try testing.expectEqual(@as(usize, 8), s.totalRows());
+
+    // Only 2 rows of history are left above the active
+    {
+        const pt = s.getCell(.{ .active = .{} }).?.screenPoint();
+        try testing.expectEqual(point.Point{ .screen = .{
+            .x = 0,
+            .y = 2,
+        } }, pt);
+    }
+    try testing.expectEqual(
+        @as(u21, 'C'),
+        s.getCell(.{ .active = .{ .y = 0 } }).?.cell.content.codepoint.data,
+    );
+}
+
+test "PageList resize reflow more cols more rows scrollback pull never" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Growing cols reflows before growing rows, so the policy has to
+    // survive resizeCols running first
+    var s = try init(alloc, .{ .cols = 10, .rows = 3 });
+    defer s.deinit();
+    try s.growRows(5);
+    const page = s.pages.first.?.page();
+    for (0..s.totalRows()) |y| {
+        const rac = page.getRowAndCell(0, y);
+        rac.cell.* = .{
+            .content_tag = .codepoint,
+            .content = .{ .codepoint = .{ .data = @intCast(y + 'A') } },
+        };
+    }
+
+    try s.resize(.{ .cols = 20, .rows = 6, .reflow = true, .scrollback_pull = .never });
+    try testing.expectEqual(@as(usize, 20), s.cols);
+    try testing.expectEqual(@as(usize, 6), s.rows);
+
+    // 11 because the 3 added rows are blank; pulling would give us 8
+    try testing.expectEqual(@as(usize, 11), s.totalRows());
+
+    // All 5 rows of history are still history
+    {
+        const pt = s.getCell(.{ .active = .{} }).?.screenPoint();
+        try testing.expectEqual(point.Point{ .screen = .{
+            .x = 0,
+            .y = 5,
+        } }, pt);
+    }
+    try testing.expectEqual(
+        @as(u21, 'F'),
+        s.getCell(.{ .active = .{ .y = 0 } }).?.cell.content.codepoint.data,
+    );
+}
+
+test "PageList resize reflow less cols more rows scrollback pull never" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Shrinking cols grows the rows through a copy of the options and then
+    // reflows. A cursor is given because Screen.resize always gives one.
+    var s = try init(alloc, .{ .cols = 10, .rows = 3 });
+    defer s.deinit();
+    try s.growRows(5);
+    const page = s.pages.first.?.page();
+    for (0..s.totalRows()) |y| {
+        const rac = page.getRowAndCell(0, y);
+        rac.cell.* = .{
+            .content_tag = .codepoint,
+            .content = .{ .codepoint = .{ .data = @intCast(y + 'A') } },
+        };
+    }
+
+    try s.resize(.{
+        .cols = 5,
+        .rows = 6,
+        .reflow = true,
+        .cursor = .{ .x = 0, .y = s.rows - 1 },
+        .scrollback_pull = .never,
+    });
+    try testing.expectEqual(@as(usize, 5), s.cols);
+    try testing.expectEqual(@as(usize, 6), s.rows);
+
+    // 11 because the 3 added rows are blank; pulling would give us 8
+    try testing.expectEqual(@as(usize, 11), s.totalRows());
+
+    // All 5 rows of history are still history
+    {
+        const pt = s.getCell(.{ .active = .{} }).?.screenPoint();
+        try testing.expectEqual(point.Point{ .screen = .{
+            .x = 0,
+            .y = 5,
+        } }, pt);
+    }
+}
+
+test "PageList resize reflow more cols scrollback pull never" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // 4 total rows at 5 cols: 'A' in history, then 'B', then a 'C' row
+    // soft-wrapped across two rows. Unwrapping 'C' at 10 cols frees
+    // exactly one active row.
+    var s = try init(alloc, .{ .cols = 5, .rows = 3 });
+    defer s.deinit();
+    try s.growRows(1);
+    try testing.expect(s.pages.first == s.pages.last);
+    const page = s.pages.first.?.page();
+    for ([_]u21{ 'A', 'B', 'C', 'C' }, 0..) |cp, y| {
+        const len: usize = switch (y) {
+            0, 1 => 3,
+            2 => 5,
+            else => 4,
+        };
+        if (y == 2) page.getRowAndCell(0, y).row.wrap = true;
+        if (y == 3) page.getRowAndCell(0, y).row.wrap_continuation = true;
+        for (0..len) |x| {
+            const rac = page.getRowAndCell(x, y);
+            rac.cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = .{ .data = cp } },
+            };
+        }
+    }
+
+    // Active starts one row into the screen
+    try testing.expectEqual(@as(usize, 4), s.totalRows());
+    {
+        const pt = s.getCell(.{ .active = .{} }).?.screenPoint();
+        try testing.expectEqual(point.Point{ .screen = .{ .x = 0, .y = 1 } }, pt);
+    }
+
+    try s.resize(.{
+        .cols = 10,
+        .reflow = true,
+        .cursor = .{ .x = 3, .y = 2 },
+        .scrollback_pull = .never,
+    });
+    try testing.expectEqual(@as(usize, 10), s.cols);
+
+    // 4 because the freed row becomes blank at the bottom instead of 'A'
+    // coming back out of history. Pulling would give us 3.
+    try testing.expectEqual(@as(usize, 4), s.totalRows());
+
+    // Active still starts one row in, on the same 'B' row as before
+    {
+        const pt = s.getCell(.{ .active = .{} }).?.screenPoint();
+        try testing.expectEqual(point.Point{ .screen = .{ .x = 0, .y = 1 } }, pt);
+    }
+    try testing.expectEqual(
+        @as(u21, 'B'),
+        s.getCell(.{ .active = .{ .y = 0 } }).?.cell.content.codepoint.data,
+    );
+}
+
+test "PageList resize reflow less cols more rows scrollback pull never rewraps history" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // 5 total rows at 6 cols: a 9-cell 'A' row wrapped across two rows,
+    // then 'B', 'C', 'D'. Active is the last two, 'C' and 'D'.
+    var s = try init(alloc, .{ .cols = 6, .rows = 2 });
+    defer s.deinit();
+    try s.growRows(3);
+    try testing.expect(s.pages.first == s.pages.last);
+    const page = s.pages.first.?.page();
+    for ([_]u21{ 'A', 'A', 'B', 'C', 'D' }, 0..) |cp, y| {
+        const len: usize = if (y == 0) 6 else 3;
+        if (y == 0) page.getRowAndCell(0, y).row.wrap = true;
+        if (y == 1) page.getRowAndCell(0, y).row.wrap_continuation = true;
+        for (0..len) |x| {
+            const rac = page.getRowAndCell(x, y);
+            rac.cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = .{ .data = cp } },
+            };
+        }
+    }
+    try testing.expectEqual(@as(usize, 5), s.totalRows());
+    {
+        const pt = s.getCell(.{ .active = .{} }).?.screenPoint();
+        try testing.expectEqual(point.Point{ .screen = .{ .x = 0, .y = 3 } }, pt);
+    }
+
+    // Rows grow first, appending blank rows, then the narrowing reflow
+    // drops them again.
+    try s.resize(.{
+        .cols = 4,
+        .rows = 4,
+        .reflow = true,
+        .cursor = .{ .x = 2, .y = 1 },
+        .scrollback_pull = .never,
+    });
+    try testing.expectEqual(@as(usize, 4), s.cols);
+    try testing.expectEqual(@as(usize, 4), s.rows);
+
+    // 8: the 9 'A' cells need 3 rows at 4 cols, plus 'B', plus the 2
+    // active content rows and 2 blank rows. Pulling 'B' would give us 7.
+    try testing.expectEqual(@as(usize, 8), s.totalRows());
+    {
+        const pt = s.getCell(.{ .active = .{} }).?.screenPoint();
+        try testing.expectEqual(point.Point{ .screen = .{ .x = 0, .y = 4 } }, pt);
+    }
+    try testing.expectEqual(
+        @as(u21, 'C'),
+        s.getCell(.{ .active = .{ .y = 0 } }).?.cell.content.codepoint.data,
+    );
 }
 
 test "PageList resize reflow more cols no wrapped rows" {

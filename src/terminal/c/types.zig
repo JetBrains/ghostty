@@ -315,6 +315,7 @@ const type_decls = [_]TypeDecl{
     .initEnum("GhosttyTerminalOption", terminal.Option, "GHOSTTY_TERMINAL_OPT_"),
     .initEnum("GhosttyTerminalProgressState", terminal.ProgressState, "GHOSTTY_TERMINAL_PROGRESS_STATE_"),
     .initEnum("GhosttyTerminalScreen", terminal.TerminalScreen, "GHOSTTY_TERMINAL_SCREEN_"),
+    .initEnum("GhosttyTerminalScrollbackPull", terminal.TerminalScrollbackPull, "GHOSTTY_TERMINAL_SCROLLBACK_PULL_"),
     .initEnum("GhosttyTerminalScrollViewportTag", terminal.ZigTerminal.ScrollViewport.Tag, "GHOSTTY_SCROLL_VIEWPORT_"),
     .initEnum("GhosttyTerminalUnknownSequenceTag", terminal.UnknownSequence.Tag, "GHOSTTY_TERMINAL_UNKNOWN_SEQUENCE_"),
 

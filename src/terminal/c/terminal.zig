@@ -1174,6 +1174,7 @@ pub const Option = enum(c_int) {
     terminfo_name = 37,
     clipboard_read = 38,
     clipboard_write_max_bytes = 39,
+    resize_scrollback_pull = 40,
 
     /// Input type expected for setting the option.
     pub fn InType(comptime self: Option) type {
@@ -1215,6 +1216,7 @@ pub const Option = enum(c_int) {
             .default_cursor_style => ?*const TerminalCursorStyle,
             .default_cursor_blink => ?*const bool,
             .mode, .mode_default => ?*const ModeConfig,
+            .resize_scrollback_pull => ?*const TerminalScrollbackPull,
         };
     }
 };
@@ -1434,6 +1436,12 @@ fn setTyped(
                 else => unreachable,
             }
         },
+        .resize_scrollback_pull => {
+            wrapper.terminal.resize_scrollback_pull = if (value) |ptr|
+                ptr.toZig() orelse return .invalid_value
+            else
+                .default;
+        },
     }
     return .success;
 }
@@ -1452,6 +1460,23 @@ pub const TerminalCursorStyle = enum(c_int) {
             .block => .block,
             .underline => .underline,
             .block_hollow => .block_hollow,
+            _ => null,
+        };
+    }
+};
+
+/// C: GhosttyTerminalScrollbackPull
+pub const TerminalScrollbackPull = enum(c_int) {
+    always = 0,
+    cursor_at_bottom = 1,
+    never = 2,
+    _,
+
+    fn toZig(self: TerminalScrollbackPull) ?PageList.ScrollbackPull {
+        return switch (self) {
+            .always => .always,
+            .cursor_at_bottom => .cursor_at_bottom,
+            .never => .never,
             _ => null,
         };
     }
@@ -3365,6 +3390,93 @@ test "set default cursor style and blink" {
     reset(t);
     try testing.expectEqual(Screen.CursorStyle.underline, t.?.terminal.screens.active.cursor.cursor_style);
     try testing.expect(t.?.terminal.modes.get(.cursor_blinking));
+}
+
+test "set resize scrollback pull" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    // Defaults to the cursor-gated policy
+    try testing.expectEqual(
+        PageList.ScrollbackPull.cursor_at_bottom,
+        t.?.terminal.resize_scrollback_pull,
+    );
+
+    var pull: TerminalScrollbackPull = .never;
+    try testing.expectEqual(Result.success, set(t, .resize_scrollback_pull, @ptrCast(&pull)));
+    try testing.expectEqual(
+        PageList.ScrollbackPull.never,
+        t.?.terminal.resize_scrollback_pull,
+    );
+
+    pull = .always;
+    try testing.expectEqual(Result.success, set(t, .resize_scrollback_pull, @ptrCast(&pull)));
+    try testing.expectEqual(
+        PageList.ScrollbackPull.always,
+        t.?.terminal.resize_scrollback_pull,
+    );
+
+    pull = .cursor_at_bottom;
+    try testing.expectEqual(Result.success, set(t, .resize_scrollback_pull, @ptrCast(&pull)));
+    try testing.expectEqual(
+        PageList.ScrollbackPull.cursor_at_bottom,
+        t.?.terminal.resize_scrollback_pull,
+    );
+}
+
+test "set resize scrollback pull null resets to default" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    var pull: TerminalScrollbackPull = .never;
+    try testing.expectEqual(Result.success, set(t, .resize_scrollback_pull, @ptrCast(&pull)));
+    try testing.expectEqual(
+        PageList.ScrollbackPull.never,
+        t.?.terminal.resize_scrollback_pull,
+    );
+
+    try testing.expectEqual(Result.success, set(t, .resize_scrollback_pull, null));
+    try testing.expectEqual(
+        PageList.ScrollbackPull.cursor_at_bottom,
+        t.?.terminal.resize_scrollback_pull,
+    );
+}
+
+test "set resize scrollback pull invalid value" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    var pull: TerminalScrollbackPull = .never;
+    try testing.expectEqual(Result.success, set(t, .resize_scrollback_pull, @ptrCast(&pull)));
+
+    // An unknown value is rejected and leaves the stored policy alone
+    var bogus: TerminalScrollbackPull = @enumFromInt(99);
+    try testing.expectEqual(
+        Result.invalid_value,
+        set(t, .resize_scrollback_pull, @ptrCast(&bogus)),
+    );
+    try testing.expectEqual(
+        PageList.ScrollbackPull.never,
+        t.?.terminal.resize_scrollback_pull,
+    );
 }
 
 test "set and get selection" {

@@ -310,6 +310,34 @@ typedef enum GHOSTTY_ENUM_TYPED {
 } GhosttyTerminalCursorStyle;
 
 /**
+ * Policy for whether a resize may pull rows back from scrollback.
+ *
+ * @ingroup terminal
+ */
+typedef enum GHOSTTY_ENUM_TYPED {
+  /** Always pull on row growth, regardless of the cursor position. */
+  GHOSTTY_TERMINAL_SCROLLBACK_PULL_ALWAYS = 0,
+
+  /**
+   * Pull on row growth only if the cursor is on the bottom row.
+   * This is the default.
+   */
+  GHOSTTY_TERMINAL_SCROLLBACK_PULL_CURSOR_AT_BOTTOM = 1,
+
+  /**
+   * Never pull. Row growth appends blank rows at the bottom instead,
+   * and a column change keeps the top of the screen on the content it was on
+   * before the resize, so that reflow cannot slide it back over scrollback either.
+   *
+   * A logical line is only fully in scrollback once every one of its rows has left
+   * the screen. A soft-wrapped logical line with any row still on screen can still
+   * unwrap back into view, since it is not fully in scrollback yet.
+   */
+  GHOSTTY_TERMINAL_SCROLLBACK_PULL_NEVER = 2,
+  GHOSTTY_TERMINAL_SCROLLBACK_PULL_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
+} GhosttyTerminalScrollbackPull;
+
+/**
  * Scrollbar state for the terminal viewport.
  *
  * Represents the scrollable area dimensions needed to render a scrollbar.
@@ -1545,6 +1573,26 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Input type: size_t*
    */
   GHOSTTY_TERMINAL_OPT_CLIPBOARD_WRITE_MAX_BYTES = 39,
+
+  /**
+   * Set the policy for whether a resize may pull rows back from scrollback.
+   * See GhosttyTerminalScrollbackPull for the exact guarantee each value makes.
+   * The default is GHOSTTY_TERMINAL_SCROLLBACK_PULL_CURSOR_AT_BOTTOM.
+   *
+   * Embedders whose pty maintains a screen buffer of its own should prefer
+   * GHOSTTY_TERMINAL_SCROLLBACK_PULL_NEVER, since that buffer usually holds
+   * no scrollback and cannot pull anything back. Windows ConPTY is the
+   * motivating case.
+   *
+   * This is embedder configuration rather than terminal state, so it is
+   * preserved across a full reset (RIS). A terminal restored from a snapshot
+   * starts at the default and must have the option re-applied.
+   *
+   * A NULL value pointer resets to the built-in default.
+   *
+   * Input type: GhosttyTerminalScrollbackPull*
+   */
+  GHOSTTY_TERMINAL_OPT_RESIZE_SCROLLBACK_PULL = 40,
   GHOSTTY_TERMINAL_OPT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalOption;
 
@@ -2005,6 +2053,10 @@ GHOSTTY_API void ghostty_terminal_reset(GhosttyTerminal terminal);
  * Changes the number of columns and rows in the terminal. The primary
  * screen will reflow content if wraparound mode is enabled; the alternate
  * screen does not reflow. If the dimensions are unchanged, this is a no-op.
+ *
+ * A resize may pull rows back from scrollback, both when the row count grows
+ * and when reflow changes how many rows the screen's text needs.
+ * Use GHOSTTY_TERMINAL_OPT_RESIZE_SCROLLBACK_PULL to control that.
  *
  * This also updates the terminal's pixel dimensions (used for image
  * protocols and size reports), disables synchronized output mode (allowed

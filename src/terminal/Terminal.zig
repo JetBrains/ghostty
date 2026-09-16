@@ -97,6 +97,9 @@ glyph_glossary: glyph.Glossary = .empty,
 /// nothing for it. Non-null means a client currently accepts drops.
 kitty_dnd: ?*kitty.dnd.State = null,
 
+/// Whether a resize may pull rows back from scrollback.
+resize_scrollback_pull: PageList.ScrollbackPull = .default,
+
 /// These are just a packed set of flags we may set on the terminal.
 flags: packed struct {
     // This supports a Kitty extension where programs using semantic
@@ -4089,6 +4092,7 @@ pub fn resize(
         .rows = opts.rows,
         .reflow = self.modes.get(.wraparound),
         .prompt_redraw = self.flags.shell_redraws_prompt,
+        .scrollback_pull = self.resize_scrollback_pull,
     });
 
     // Alternate screen, if it exists, doesn't reflow. The primary resize
@@ -4102,6 +4106,7 @@ pub fn resize(
                 .cols = opts.cols,
                 .rows = opts.rows,
                 .reflow = false,
+                .scrollback_pull = self.resize_scrollback_pull,
             }) catch |err| break :resize err;
 
             // Resize succeeded.
@@ -15787,6 +15792,121 @@ test "Terminal: resize with left and right margin set" {
     try t.printRepeat(1850);
     _ = t.modes.restore(.enable_mode_3);
     try t.resize(alloc, .{ .cols = cols, .rows = rows });
+}
+
+test "Terminal: resize scrollback pull cursor_at_bottom pulls history" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .cols = 5, .rows = 3 });
+    defer t.deinit(alloc);
+
+    t.resize_scrollback_pull = .cursor_at_bottom;
+
+    // Scroll two lines off with the cursor left on the bottom row, which
+    // is when this policy pulls
+    try t.printString("1AAA\n2BBB\n3CCC\n4DDD\n5EEE");
+    {
+        const str = try t.plainString(alloc);
+        defer alloc.free(str);
+        try testing.expectEqualStrings("3CCC\n4DDD\n5EEE", str);
+    }
+
+    try t.resize(alloc, .{ .cols = 5, .rows = 5 });
+
+    const str = try t.plainString(alloc);
+    defer alloc.free(str);
+    try testing.expectEqualStrings("1AAA\n2BBB\n3CCC\n4DDD\n5EEE", str);
+}
+
+test "Terminal: resize scrollback pull never keeps history in scrollback" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .cols = 5, .rows = 3 });
+    defer t.deinit(alloc);
+
+    t.resize_scrollback_pull = .never;
+
+    try t.printString("1AAA\n2BBB\n3CCC\n4DDD\n5EEE");
+    try t.resize(alloc, .{ .cols = 5, .rows = 5 });
+
+    // The scrolled-off rows stay in scrollback
+    const str = try t.plainString(alloc);
+    defer alloc.free(str);
+    try testing.expectEqualStrings("3CCC\n4DDD\n5EEE", str);
+}
+
+test "Terminal: resize more cols scrollback pull never" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .cols = 5, .rows = 3 });
+    defer t.deinit(alloc);
+
+    t.resize_scrollback_pull = .never;
+
+    // "CCCCCCCCC" soft-wraps at 5 cols, pushing "AAA" into scrollback
+    try t.printString("AAA\nBBB\nCCCCCCCCC");
+    {
+        const str = try t.plainString(alloc);
+        defer alloc.free(str);
+        try testing.expectEqualStrings("BBB\nCCCCC\nCCCC", str);
+    }
+
+    // Widening unwraps the "C" row and frees an active row. That row must
+    // become blank at the bottom, not "AAA" coming back out of scrollback.
+    try t.resize(alloc, .{ .cols = 10, .rows = 3 });
+
+    const str = try t.plainString(alloc);
+    defer alloc.free(str);
+    try testing.expectEqualStrings("BBB\nCCCCCCCCC", str);
+}
+
+test "Terminal: resize more cols scrollback pull never alternate screen" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .cols = 5, .rows = 3 });
+    defer t.deinit(alloc);
+
+    t.resize_scrollback_pull = .never;
+    _ = try t.switchScreen(.alternate);
+    try t.printString("AAA\nBBB\nCCCCCCCCC");
+
+    // The alternate screen resizes with reflow off and keeps no scrollback,
+    // so the policy has nothing to do there.
+    try t.resize(alloc, .{ .cols = 10, .rows = 3 });
+
+    const str = try t.plainString(alloc);
+    defer alloc.free(str);
+    try testing.expectEqualStrings("BBB\nCCCCC\nCCCC", str);
+}
+
+test "Terminal: resize scrollback pull defaults to cursor_at_bottom" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .cols = 5, .rows = 3 });
+    defer t.deinit(alloc);
+
+    // Every other test states its policy explicitly, so this is the only
+    // place the documented default is asserted.
+    try testing.expectEqual(
+        PageList.ScrollbackPull.cursor_at_bottom,
+        PageList.ScrollbackPull.default,
+    );
+    try testing.expectEqual(
+        PageList.ScrollbackPull.default,
+        t.resize_scrollback_pull,
+    );
+}
+
+test "Terminal: resize scrollback pull survives full reset" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .cols = 5, .rows = 3 });
+    defer t.deinit(alloc);
+
+    // Embedder configuration, not terminal state, so RIS must not clear it
+    t.resize_scrollback_pull = .never;
+    t.fullReset();
+    try testing.expectEqual(PageList.ScrollbackPull.never, t.resize_scrollback_pull);
 }
 
 // https://github.com/mitchellh/ghostty/issues/1343
